@@ -72,12 +72,14 @@ class EventOut(BaseModel):
 @app.on_event("startup")
 def startup():
     try:
-        init_db()  # should create engine/tables if needed
-        print("[startup] init_db completed")
+        print("[startup] calling init_db()")
+        init_db()
+        print("[startup] init_db completed successfully")
     except Exception as e:
-        # log but DO NOT crash the app — /health stays responsive
-        print(f"[startup] init_db failed (non-fatal): {e}")
-
+        import traceback
+        print("[startup] init_db failed (non-fatal):")
+        traceback.print_exc()
+        
 # -----------------------------------------------------------------------------
 # helpers
 # -----------------------------------------------------------------------------
