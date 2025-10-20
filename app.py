@@ -1,4 +1,4 @@
-# app.py — Main FastAPI Application (resilient startup + safe health checks)
+# app.py — Main FastAPI Application
 #
 # Endpoints:
 #   GET  /            → friendly message
@@ -10,13 +10,15 @@
 #   GET  /events/search
 #   POST /scan        → Bearer protected
 #
-# Env (Railway):
-#   DATABASE_URL  = <Neon URL> (postgresql://…)
+# Env (Railway or .env):
+#   DATABASE_URL  = <your Neon/Postgres URL>
 #   BEARER_TOKEN  or ADMIN_BEARER
 
 import os
 import re
+import time
 import hashlib
+import traceback
 from contextlib import suppress
 from datetime import datetime
 from typing import List, Optional
@@ -26,28 +28,43 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, text
+from dotenv import load_dotenv
+
+# Load environment variables from .env for local use
+load_dotenv()
 
 from storage import init_db, get_db, Event as EventModel
 from parser import parse_email_to_events
 from inbox import get_inbox
 
-# -----------------------------------------------------------------------------
-# config
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
 ADMIN_BEARER = os.getenv("BEARER_TOKEN") or os.getenv("ADMIN_BEARER") or "change-me"
 
-# -----------------------------------------------------------------------------
-# app
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# FastAPI App
+# --------------------------------------------------------------------------
 app = FastAPI(
     title="AI Events Agent",
     version="0.1.0",
     description="Reads emails → extracts event info → stores in Postgres → simple API.",
 )
 
-# -----------------------------------------------------------------------------
-# schema (response model)
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Middleware: log all requests
+# --------------------------------------------------------------------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = round((time.time() - start_time) * 1000)
+    print(f"{request.method} {request.url.path} → {response.status_code} [{duration}ms]")
+    return response
+
+# --------------------------------------------------------------------------
+# Schema (API Response Model)
+# --------------------------------------------------------------------------
 class EventOut(BaseModel):
     id: str
     title: str
@@ -66,23 +83,22 @@ class EventOut(BaseModel):
     class Config:
         from_attributes = True
 
-# -----------------------------------------------------------------------------
-# startup (best-effort: don't block the server if DB is unreachable)
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Startup (safe, non-blocking)
+# --------------------------------------------------------------------------
 @app.on_event("startup")
 def startup():
     try:
         print("[startup] calling init_db()")
         init_db()
         print("[startup] init_db completed successfully")
-    except Exception as e:
-        import traceback
+    except Exception:
         print("[startup] init_db failed (non-fatal):")
         traceback.print_exc()
-        
-# -----------------------------------------------------------------------------
-# helpers
-# -----------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Auth helper
+# --------------------------------------------------------------------------
 def require_bearer(request: Request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -91,6 +107,9 @@ def require_bearer(request: Request):
     if token != ADMIN_BEARER:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Bearer token")
 
+# --------------------------------------------------------------------------
+# Utility functions
+# --------------------------------------------------------------------------
 _slugify_re = re.compile(r"[^a-z0-9]+")
 def slugify(s: str) -> str:
     s = (s or "").lower()
@@ -98,24 +117,16 @@ def slugify(s: str) -> str:
     return s or "untitled"
 
 def make_event_id(source_type: str, source_message_id: str, title: str, index: int | None = None) -> str:
-    """
-    Stable, short id that matches storage.Event primary key (str).
-    Combines source_type, message id, and title; appends index for multi-parsed events.
-    """
     base = f"{source_type or 'mock'}::{source_message_id or 'unknown'}::{title or 'untitled'}"
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
     suffix = f"-{index}" if index is not None else ""
     return f"{(source_type or 'mock')}-{slugify(source_message_id)}-{slugify(title)}-{h}{suffix}"
 
-# small helper to test DB without blocking the app if it fails
 def _probe_db_count() -> Optional[int]:
     session: Optional[Session] = None
     try:
-        # get_db() is a generator dependency; pull one session manually
         session = next(get_db())
-        # lightweight probe (avoids ORM layer work)
         session.execute(text("SELECT 1"))
-        # optional: count for visibility (can remove if you want it ultra-fast)
         count = session.query(EventModel).count()
         return count
     except Exception as e:
@@ -126,53 +137,36 @@ def _probe_db_count() -> Optional[int]:
             if session is not None:
                 session.close()
 
-# -----------------------------------------------------------------------------
-# friendly root
-# -----------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
 @app.get("/", include_in_schema=False)
 def root():
     return {"msg": "ai-events-agent is running", "docs": "/docs", "health": "/health"}
 
-# -----------------------------------------------------------------------------
-# health (ALWAYS fast, NO DB)
-# -----------------------------------------------------------------------------
 @app.get("/health", include_in_schema=False)
 def health():
-    # purely app-level health so Railway edge doesn't time out
     return {"ok": True}
 
-# Optional DB health (non-fatal, for your own checks)
 @app.get("/health/db", include_in_schema=False)
 def health_db():
+    start = time.time()
     count = _probe_db_count()
-    return {"ok": count is not None, "events": count}
+    duration = round((time.time() - start) * 1000)
+    return {"ok": count is not None, "events": count, "duration_ms": duration}
 
-# -----------------------------------------------------------------------------
-# events — list
-# -----------------------------------------------------------------------------
 @app.get("/events", response_model=List[EventOut])
 def list_events(db: Session = Depends(get_db)):
     return db.query(EventModel).order_by(EventModel.start.asc().nulls_last()).all()
 
 @app.get("/events/recurring", response_model=List[EventOut])
 def list_recurring(db: Session = Depends(get_db)):
-    return (
-        db.query(EventModel)
-        .filter(EventModel.recurring.is_(True))
-        .order_by(EventModel.start.asc().nulls_last())
-        .all()
-    )
+    return db.query(EventModel).filter(EventModel.recurring.is_(True)).order_by(EventModel.start.asc().nulls_last()).all()
 
 @app.get("/events/nonrecurring", response_model=List[EventOut])
 def list_nonrecurring(db: Session = Depends(get_db)):
-    return (
-        db.query(EventModel)
-        .filter(EventModel.recurring.is_(False))
-        .order_by(EventModel.start.asc().nulls_last())
-        .all()
-    )
+    return db.query(EventModel).filter(EventModel.recurring.is_(False)).order_by(EventModel.start.asc().nulls_last()).all()
 
-# search
 @app.get("/events/search", response_model=List[EventOut])
 def search_events(
     q: Optional[str] = Query(default=None),
@@ -196,14 +190,11 @@ def search_events(
         query = query.filter(EventModel.recurring.is_(False))
     return query.order_by(EventModel.start.asc().nulls_last()).all()
 
-# -----------------------------------------------------------------------------
-# scan — bearer protected
-# -----------------------------------------------------------------------------
 @app.post("/scan")
 def scan(request: Request, db: Session = Depends(get_db)):
     require_bearer(request)
 
-    messages = get_inbox()  # list of mock email dicts/objects
+    messages = get_inbox()
     parsed_events_total = 0
     created = updated = skipped = 0
 
@@ -222,24 +213,15 @@ def scan(request: Request, db: Session = Depends(get_db)):
             source_message_id = data.get("source_message_id") or getattr(msg, "id", "unknown")
             recurring = bool(data.get("recurring", False))
 
-            eid = data.get("id") or make_event_id(
-                source_type, source_message_id, title, idx if len(results) > 1 else None
-            )
+            eid = data.get("id") or make_event_id(source_type, source_message_id, title, idx if len(results) > 1 else None)
 
-            existing = (
-                db.query(EventModel)
-                .filter(
-                    EventModel.source_message_id == source_message_id,
-                    EventModel.title == title,
-                )
-                .first()
-            )
+            existing = db.query(EventModel).filter(
+                EventModel.source_message_id == source_message_id,
+                EventModel.title == title,
+            ).first()
 
             if existing:
-                for k in [
-                    "start", "end", "location", "description",
-                    "recurring", "recurrence_rule", "source_type", "source_snippet",
-                ]:
+                for k in ["start", "end", "location", "description", "recurring", "recurrence_rule", "source_type", "source_snippet"]:
                     if k in data and data[k] is not None:
                         setattr(existing, k, data[k])
                 existing.updated_at = datetime.utcnow()
@@ -259,17 +241,3 @@ def scan(request: Request, db: Session = Depends(get_db)):
                     source_snippet=data.get("source_snippet"),
                     created_at=datetime.utcnow(),
                     updated_at=datetime.utcnow(),
-                )
-                db.add(model)
-                created += 1
-
-    db.commit()
-    total = db.query(EventModel).count()
-    return {
-        "ok": True,
-        "parsed": parsed_events_total,
-        "created": created,
-        "updated": updated,
-        "skipped": skipped,
-        "total_events": total,
-    }
