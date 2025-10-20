@@ -1,16 +1,18 @@
-# app.py — Main FastAPI Application (super simple & well documented)
+# app.py — Main FastAPI Application (resilient startup + safe health checks)
 #
 # Endpoints:
-#   GET  /health
+#   GET  /            → friendly message
+#   GET  /health      → ALWAYS fast, no DB
+#   GET  /health/db   → optional DB probe (non-fatal)
 #   GET  /events
 #   GET  /events/recurring
 #   GET  /events/nonrecurring
 #   GET  /events/search
-#   POST /scan    (Bearer protected)
+#   POST /scan        → Bearer protected
 #
 # Env (Railway):
-#   DATABASE_URL  = <Neon URL>  (postgresql://… OR postgresql+psycopg://…)
-#   BEARER_TOKEN  = alpha-12345 (or use ADMIN_BEARER; both supported)
+#   DATABASE_URL  = <Neon URL> (postgresql://…)
+#   BEARER_TOKEN  or ADMIN_BEARER
 
 import os
 import re
@@ -23,7 +25,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 
 from storage import init_db, get_db, Event as EventModel
 from parser import parse_email_to_events
@@ -65,11 +67,16 @@ class EventOut(BaseModel):
         from_attributes = True
 
 # -----------------------------------------------------------------------------
-# startup
+# startup (best-effort: don't block the server if DB is unreachable)
 # -----------------------------------------------------------------------------
 @app.on_event("startup")
 def startup():
-    init_db()
+    try:
+        init_db()  # should create engine/tables if needed
+        print("[startup] init_db completed")
+    except Exception as e:
+        # log but DO NOT crash the app — /health stays responsive
+        print(f"[startup] init_db failed (non-fatal): {e}")
 
 # -----------------------------------------------------------------------------
 # helpers
@@ -94,27 +101,49 @@ def make_event_id(source_type: str, source_message_id: str, title: str, index: i
     Combines source_type, message id, and title; appends index for multi-parsed events.
     """
     base = f"{source_type or 'mock'}::{source_message_id or 'unknown'}::{title or 'untitled'}"
-    # short hash to keep id length safe
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
     suffix = f"-{index}" if index is not None else ""
     return f"{(source_type or 'mock')}-{slugify(source_message_id)}-{slugify(title)}-{h}{suffix}"
 
+# small helper to test DB without blocking the app if it fails
+def _probe_db_count() -> Optional[int]:
+    session: Optional[Session] = None
+    try:
+        # get_db() is a generator dependency; pull one session manually
+        session = next(get_db())
+        # lightweight probe (avoids ORM layer work)
+        session.execute(text("SELECT 1"))
+        # optional: count for visibility (can remove if you want it ultra-fast)
+        count = session.query(EventModel).count()
+        return count
+    except Exception as e:
+        print(f"[health/db] probe failed: {e}")
+        return None
+    finally:
+        with suppress(Exception):
+            if session is not None:
+                session.close()
+
 # -----------------------------------------------------------------------------
 # friendly root
 # -----------------------------------------------------------------------------
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
-    return {"msg": "ai-events-agent is running. See /health and /docs"}
+    return {"msg": "ai-events-agent is running", "docs": "/docs", "health": "/health"}
 
 # -----------------------------------------------------------------------------
-# health
+# health (ALWAYS fast, NO DB)
 # -----------------------------------------------------------------------------
-@app.get("/health")
-def health(db: Session = Depends(get_db)):
-    with suppress(Exception):
-        count = db.query(EventModel).count()
-        return {"ok": True, "events": count}
-    return JSONResponse(status_code=500, content={"ok": False, "events": 0})
+@app.get("/health", include_in_schema=False)
+def health():
+    # purely app-level health so Railway edge doesn't time out
+    return {"ok": True}
+
+# Optional DB health (non-fatal, for your own checks)
+@app.get("/health/db", include_in_schema=False)
+def health_db():
+    count = _probe_db_count()
+    return {"ok": count is not None, "events": count}
 
 # -----------------------------------------------------------------------------
 # events — list
@@ -185,17 +214,16 @@ def scan(request: Request, db: Session = Depends(get_db)):
 
         for idx, ev in enumerate(results):
             parsed_events_total += 1
-            # normalize
             data = dict(ev)
             title = data.get("title") or "Untitled"
             source_type = data.get("source_type") or "mock"
             source_message_id = data.get("source_message_id") or getattr(msg, "id", "unknown")
             recurring = bool(data.get("recurring", False))
 
-            # generate REQUIRED primary key id to match storage.Event
-            eid = data.get("id") or make_event_id(source_type, source_message_id, title, idx if len(results) > 1 else None)
+            eid = data.get("id") or make_event_id(
+                source_type, source_message_id, title, idx if len(results) > 1 else None
+            )
 
-            # look for an existing row (upsert key)
             existing = (
                 db.query(EventModel)
                 .filter(
@@ -216,7 +244,7 @@ def scan(request: Request, db: Session = Depends(get_db)):
                 updated += 1
             else:
                 model = EventModel(
-                    id=eid,  # <-- required
+                    id=eid,
                     title=title,
                     start=data.get("start"),
                     end=data.get("end"),
