@@ -1,18 +1,4 @@
-# app.py — Main FastAPI Application
-#
-# Endpoints:
-#   GET  /            → friendly message
-#   GET  /health      → ALWAYS fast, no DB
-#   GET  /health/db   → optional DB probe (non-fatal)
-#   GET  /events
-#   GET  /events/recurring
-#   GET  /events/nonrecurring
-#   GET  /events/search
-#   POST /scan        → Bearer protected
-#
-# Env (Railway or .env):
-#   DATABASE_URL  = <your Neon/Postgres URL>
-#   BEARER_TOKEN  or ADMIN_BEARER
+# app.py — Main FastAPI Application for AI Events Agent
 
 import os
 import re
@@ -30,7 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, text
 from dotenv import load_dotenv
 
-# Load environment variables from .env for local use
+# Load environment variables for local dev
 load_dotenv()
 
 from storage import init_db, get_db, Event as EventModel
@@ -41,6 +27,7 @@ from inbox import get_inbox
 # Config
 # --------------------------------------------------------------------------
 ADMIN_BEARER = os.getenv("BEARER_TOKEN") or os.getenv("ADMIN_BEARER") or "change-me"
+PORT = int(os.getenv("PORT", "8080"))  # Railway assigns $PORT dynamically
 
 # --------------------------------------------------------------------------
 # FastAPI App
@@ -48,11 +35,11 @@ ADMIN_BEARER = os.getenv("BEARER_TOKEN") or os.getenv("ADMIN_BEARER") or "change
 app = FastAPI(
     title="AI Events Agent",
     version="0.1.0",
-    description="Reads emails → extracts event info → stores in Postgres → simple API.",
+    description="Reads emails → extracts event info → stores in Neon Postgres → exposes API.",
 )
 
 # --------------------------------------------------------------------------
-# Middleware: log all requests
+# Middleware (log requests)
 # --------------------------------------------------------------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -63,7 +50,7 @@ async def log_requests(request: Request, call_next):
     return response
 
 # --------------------------------------------------------------------------
-# Schema (API Response Model)
+# Response Schema
 # --------------------------------------------------------------------------
 class EventOut(BaseModel):
     id: str
@@ -84,10 +71,10 @@ class EventOut(BaseModel):
         from_attributes = True
 
 # --------------------------------------------------------------------------
-# Startup (safe, non-blocking)
+# Startup
 # --------------------------------------------------------------------------
 @app.on_event("startup")
-def startup():
+async def startup():
     try:
         print("[startup] calling init_db()")
         init_db()
@@ -108,7 +95,7 @@ def require_bearer(request: Request):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Bearer token")
 
 # --------------------------------------------------------------------------
-# Utility functions
+# Helpers
 # --------------------------------------------------------------------------
 _slugify_re = re.compile(r"[^a-z0-9]+")
 def slugify(s: str) -> str:
@@ -142,7 +129,11 @@ def _probe_db_count() -> Optional[int]:
 # --------------------------------------------------------------------------
 @app.get("/", include_in_schema=False)
 def root():
-    return {"msg": "ai-events-agent is running", "docs": "/docs", "health": "/health"}
+    return {
+        "msg": "✅ AI Events Agent is running successfully!",
+        "docs": "/docs",
+        "health": "/health",
+    }
 
 @app.get("/health", include_in_schema=False)
 def health():
@@ -193,7 +184,6 @@ def search_events(
 @app.post("/scan")
 def scan(request: Request, db: Session = Depends(get_db)):
     require_bearer(request)
-
     messages = get_inbox()
     parsed_events_total = 0
     created = updated = skipped = 0
@@ -212,7 +202,6 @@ def scan(request: Request, db: Session = Depends(get_db)):
             source_type = data.get("source_type") or "mock"
             source_message_id = data.get("source_message_id") or getattr(msg, "id", "unknown")
             recurring = bool(data.get("recurring", False))
-
             eid = data.get("id") or make_event_id(source_type, source_message_id, title, idx if len(results) > 1 else None)
 
             existing = db.query(EventModel).filter(
@@ -241,3 +230,15 @@ def scan(request: Request, db: Session = Depends(get_db)):
                     source_snippet=data.get("source_snippet"),
                     created_at=datetime.utcnow(),
                     updated_at=datetime.utcnow(),
+                )
+                db.add(model)
+                created += 1
+    db.commit()
+    return {"parsed": parsed_events_total, "created": created, "updated": updated, "skipped": skipped}
+
+# --------------------------------------------------------------------------
+# Local dev entrypoint (used when running locally)
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
