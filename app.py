@@ -1,4 +1,4 @@
-# app.py — Main FastAPI Application (Railway-ready)
+# app.py — Main FastAPI Application (Railway-ready, async root)
 import os
 import re
 import time
@@ -9,7 +9,6 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Query, status
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, text
@@ -100,22 +99,34 @@ def _probe_db_count() -> Optional[int]:
             if session is not None:
                 session.close()
 
+# -------------------------
+# Async root to prevent 502
+# -------------------------
 @app.get("/", include_in_schema=False)
-def root():
-    print("[root] request received")  # Debug
+async def root():
+    print("[root] request received")
     return {"msg": "ai-events-agent is running", "docs": "/docs", "health": "/health"}
 
 @app.get("/health", include_in_schema=False)
-def health():
+async def health():
     return {"ok": True}
 
-# ... rest of your existing routes here ...
+@app.get("/health/db", include_in_schema=False)
+async def health_db():
+    start = time.time()
+    count = _probe_db_count()
+    duration = round((time.time() - start) * 1000)
+    return {"ok": count is not None, "events": count, "duration_ms": duration}
+
+# -------------------------
+# Add remaining routes here as they were
+# -------------------------
 
 # --------------------------------------------------
 # Entry point for Railway
 # --------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8080))  # Use Railway PORT or default 8080
+    port = int(os.getenv("PORT", 8080))
     print(f"[main] Starting Uvicorn on port {port}")
     uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info")
