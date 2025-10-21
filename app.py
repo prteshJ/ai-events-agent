@@ -244,7 +244,7 @@ def search_events(
 # Events: admin import (mock inbox → parser → db)
 # --------------------------------------------------
 @app.post("/events/import", summary="Import emails → parse → save events (admin)")
-def import_emails(request: Request, db: Session = Depends(get_db)):
+async def import_emails(request: Request, db: Session = Depends(get_db)):
     """
     Admin-only:
     - Fetch emails (mock inbox for now).
@@ -253,25 +253,41 @@ def import_emails(request: Request, db: Session = Depends(get_db)):
     """
     require_bearer(request)
 
-    # get_inbox() is async; run it fully
-    emails = asyncio.get_event_loop().run_until_complete(get_inbox())
+    # get_inbox() is async; await it directly
+    try:
+        emails = await get_inbox()
+    except Exception as e:
+        # Surface a clear error if inbox fetch fails
+        raise HTTPException(status_code=500, detail=f"failed to read inbox: {e}")
 
+    if not emails:
+        # Not an error; just informative
+        print("[import] inbox returned 0 messages")
+
+    written = 0
     for mail in emails:
-        events = parse_email_to_events(mail) or []
-        for e in events:
-            evt = EventModel(
-                id=e["_id"],  # parser uses _id → we store as id
-                title=e["title"] or "Untitled",
-                start=e.get("start"),  # stored as ISO string (v1)
-                end=e.get("end"),
-                location=e.get("location"),
-                description=e.get("description"),
-                recurring=bool(e.get("recurring")),
-                recurrence_rule=e.get("recurrence_rule"),
-                source_type=e.get("source_type") or "mock",
-                source_message_id=e.get("source_message_id") or "unknown",
-                source_snippet=e.get("source_snippet"),
-            )
-            db.merge(evt)  # merge = upsert by primary key
+        try:
+            events = parse_email_to_events(mail) or []
+            for e in events:
+                evt = EventModel(
+                    id=e["_id"],  # parser uses _id → we store as id
+                    title=e["title"] or "Untitled",
+                    start=e.get("start"),   # stored as ISO string (v1)
+                    end=e.get("end"),
+                    location=e.get("location"),
+                    description=e.get("description"),
+                    recurring=bool(e.get("recurring")),
+                    recurrence_rule=e.get("recurrence_rule"),
+                    source_type=e.get("source_type") or "mock",
+                    source_message_id=e.get("source_message_id") or "unknown",
+                    source_snippet=e.get("source_snippet"),
+                )
+                db.merge(evt)   # merge = upsert by primary key
+                written += 1
+        except Exception as e:
+            # Keep going even if one email fails
+            print(f"[import] parse/save error for message {mail.get('id')}: {e}")
+
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "emails": len(emails), "events_written": written}
+
