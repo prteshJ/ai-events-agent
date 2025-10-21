@@ -1,3 +1,6 @@
+Here’s the final `app.py` — same behavior as your working setup, plus the **smallest Swagger enhancement** (an Authorize button for the admin POST). Everything else stays as-is.
+
+```python
 """
 AI Events Agent — FastAPI + Railway + Neon
 ==========================================
@@ -29,15 +32,13 @@ Events:
   GET  /events/search
 
 Admin:
-  POST /events/import
+  POST /events/import             ← protected via Swagger "Authorize" (Bearer)
   GET  /events/import-web?token=...   (if ENABLE_IMPORT_WEB=true)
 
-Notes on Robustness
+Swagger Enhancement
 -------------------
-- **No route shadowing**: the catch-all route is replaced with `/events/id/{event_id}`
-  to avoid collisions with `/events/search`, `/events/by-id`, `/events/import-web`, etc.
-- **Specific routes are defined before more general ones** (defensive ordering).
-- **/robots.txt** and **/favicon.ico** return noise-free responses to reduce 404 log spam.
+- Adds a simple HTTP Bearer security scheme so Swagger shows the "Authorize" button.
+- Only /events/import uses this scheme (everything else unchanged).
 """
 
 import os
@@ -52,8 +53,9 @@ with suppress(Exception):
     from dotenv import load_dotenv
     load_dotenv()
 
-from fastapi import FastAPI, Depends, HTTPException, Request, Query
+from fastapi import FastAPI, Depends, HTTPException, Request, Query, Security
 from fastapi.responses import PlainTextResponse, Response
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, text
@@ -71,7 +73,7 @@ ENABLE_IMPORT_WEB = os.getenv("ENABLE_IMPORT_WEB", "false").lower() in ("1", "tr
 
 app = FastAPI(
     title="AI Events Agent",
-    version="1.0.5",
+    version="1.0.6",
     description="Reads emails → extracts event info → stores in Postgres → simple API.",
 )
 
@@ -104,21 +106,21 @@ def startup():
 # ------------------------------------------------------------------------------
 # Auth helpers
 # ------------------------------------------------------------------------------
-def require_bearer(request: Request):
-    """Require 'Authorization: Bearer <token>' and validate against ADMIN_BEARER."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth.removeprefix("Bearer ").strip()
-    if token != ADMIN_BEARER:
-        raise HTTPException(status_code=401, detail="Invalid Bearer token")
-
+# Browser demo token check (unchanged)
 def require_token_param(token: Optional[str]):
     """For GET /events/import-web (browser demo). Only allowed if ENABLE_IMPORT_WEB=true."""
     if not ENABLE_IMPORT_WEB:
         raise HTTPException(status_code=403, detail="import-web is disabled")
     if not token or token != ADMIN_BEARER:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+# Swagger Bearer auth (adds the Authorize button, used only on POST /events/import)
+bearer_scheme = HTTPBearer(auto_error=True)
+
+def verify_admin(credentials: HTTPAuthorizationCredentials = Security(bearer_scheme)):
+    token = (credentials.credentials or "").strip()
+    if token != ADMIN_BEARER:
+        raise HTTPException(status_code=401, detail="Invalid Bearer token")
 
 # ------------------------------------------------------------------------------
 # Utilities
@@ -195,7 +197,7 @@ class EventOut(BaseModel):
         from_attributes = True
 
 # ------------------------------------------------------------------------------
-# Events — define specific routes FIRST, then the most specific/ambiguous LAST
+# Events — define specific routes FIRST, then the unambiguous ID route LAST
 # ------------------------------------------------------------------------------
 
 @app.get("/events", response_model=List[EventOut], summary="List events")
@@ -269,8 +271,10 @@ def search_events(
 # Admin (write)
 # ------------------------------------------------------------------------------
 @app.post("/events/import", summary="Import emails → parse → save events (admin)")
-async def import_emails(request: Request, db: Session = Depends(get_db)):
-    require_bearer(request)
+async def import_emails(
+    db: Session = Depends(get_db),
+    _: None = Depends(verify_admin),  # ← Swagger "Authorize" enables Bearer here
+):
     return await _do_import(db)
 
 @app.get("/events/import-web", summary="Browser import demo (token required)")
@@ -327,3 +331,4 @@ def get_event(event_id: str, db: Session = Depends(get_db)):
     if not obj:
         raise HTTPException(status_code=404, detail="Event not found")
     return obj
+```
