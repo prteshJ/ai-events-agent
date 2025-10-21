@@ -1,41 +1,64 @@
 """
 app.py — AI Events Agent (FastAPI + Railway + Neon)
+===================================================
 
-What this service does (in plain english)
------------------------------------------
-1) Starts a small FastAPI server.
-2) Creates the database tables if they don't exist.
-3) Has health endpoints so Railway knows the app is alive.
-4) Exposes event endpoints:
-   - GET  /events           → list events
-   - GET  /events/{id}      → get a single event (URL-encode '#' as '%23' if present)
-   - GET  /events/by-id     → get a single event via query param (URL-safe)
-   - GET  /events/search    → search events (non-recurring by default)
-   - POST /events/import    → read mock inbox → parse → save events (admin only)
+What this service does (plain English)
+--------------------------------------
+1) Starts a tiny FastAPI server.
+2) Ensures Postgres tables exist at startup (via SQLAlchemy).
+3) Provides health checks so your platform (Railway) knows it's alive.
+4) Reads "emails" from a mock inbox, parses them into events, and stores them.
+5) Exposes simple endpoints to list, search, and fetch events.
 
-How “AI agent” works in v1
---------------------------
-- We simulate email reading using a mock inbox (inbox.py).
-- We parse those emails into events (parser.py).
-- We store events in Neon Postgres (storage.py).
-- Later, you can swap the mock inbox for real Gmail without changing endpoints.
+Why this file exists / what's special
+------------------------------------
+- Some event IDs can contain '#'. Browsers treat '#' as a URL fragment and
+  *don't send it to the server* in the path. To keep the database untouched:
+  - We keep /events/{id} (works if client URL-encodes '#' as '%23').
+  - We add /events/by-id?id=... which is **URL-safe** in browsers (query
+    parameters are auto-encoded by the browser).
 
-Auth for admin route
+Optional "browser import"
+-------------------------
+- POST /events/import uses a Bearer token (best practice).
+- For demos, you can enable GET /events/import-web?token=... by setting:
+    ENABLE_IMPORT_WEB=true
+  This lets non-technical folks trigger an import from a browser.
+  Turn it off after demos (set to false or remove).
+
+Environment variables you should set
+------------------------------------
+- ADMIN_BEARER (or BEARER_TOKEN): the admin token for imports
+- DATABASE_URL: your Neon/Postgres connection string
+- ENABLE_IMPORT_WEB: "true" or "false" (default false)
+
+Endpoints overview
+------------------
+- GET  /health                  -> quick liveness check
+- GET  /health/db               -> DB connectivity + event count
+- GET  /events                  -> list events (paginated)
+- GET  /events/{id}             -> fetch one event by its ID (URL-encode '#'!)
+- GET  /events/by-id?id=...     -> fetch one event by query param (browser-safe)
+- GET  /events/search           -> simple text/time search
+- POST /events/import           -> mock inbox -> parse -> upsert (admin only)
+- GET  /events/import-web       -> same import via ?token= (only if enabled)
+
+Implementation notes
 --------------------
-- Set ADMIN_BEARER (or BEARER_TOKEN) in Railway.
-- Call POST /events/import with header:  Authorization: Bearer <token>
+- Storage is in `storage.py` (SQLAlchemy model + session helpers).
+- Parsing is in `parser.py` (email -> normalized event dict(s)).
+- Inbox is in `inbox.py` (mocked async fetch).
 """
 
 import os
 import re
 import time
-import hashlib
 import traceback
 from contextlib import suppress
 from datetime import datetime
 from typing import Optional, List
 
-# .env support (safe if missing)
+# Optional .env support for local dev; harmless if missing in prod
 with suppress(Exception):
     from dotenv import load_dotenv
     load_dotenv()
@@ -45,35 +68,42 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, text
 
-# our modules
+# Local modules (provided in your repo)
 from storage import init_db, get_db, Event as EventModel
 from parser import parse_email_to_events
 from inbox import get_inbox
 
-# config
+# ------------------------------------------------------------------------------
+# Configuration (from environment)
+# ------------------------------------------------------------------------------
+# Admin token for protected routes (POST /events/import). Prefer setting ADMIN_BEARER.
 ADMIN_BEARER = os.getenv("BEARER_TOKEN") or os.getenv("ADMIN_BEARER") or "change-me"
+
+# Optional: enable a browser-friendly import URL for demos (GET /events/import-web?token=...)
+ENABLE_IMPORT_WEB = os.getenv("ENABLE_IMPORT_WEB", "false").lower() in ("1", "true", "yes")
 
 app = FastAPI(
     title="AI Events Agent",
-    version="1.0.1",
+    version="1.0.2",
     description="Reads emails → extracts event info → stores in Postgres → simple API.",
 )
 
-# --------------------------------------------------
-# Logging middleware (helps in Railway logs)
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Middleware: tiny request logger (handy in Railway logs)
+# ------------------------------------------------------------------------------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    start_time = time.time()
+    start = time.time()
     response = await call_next(request)
-    duration_ms = round((time.time() - start_time) * 1000)
-    print(f"{request.method} {request.url.path} → {response.status_code} [{duration_ms}ms]")
+    ms = round((time.time() - start) * 1000)
+    print(f"{request.method} {request.url.path} → {response.status_code} [{ms}ms]")
+    # Useful to see which git SHA is running in logs/responses
     response.headers["X-Rev"] = os.getenv("RAILWAY_GIT_COMMIT_SHA", "dev")
     return response
 
-# --------------------------------------------------
-# Startup: create tables if needed
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Startup: ensure tables exist (non-fatal if it fails; you'll see logs)
+# ------------------------------------------------------------------------------
 @app.on_event("startup")
 def startup():
     try:
@@ -84,10 +114,11 @@ def startup():
         print("[startup] init_db failed (non-fatal):")
         traceback.print_exc()
 
-# --------------------------------------------------
-# Auth helper for admin routes
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Auth helpers
+# ------------------------------------------------------------------------------
 def require_bearer(request: Request):
+    """Require 'Authorization: Bearer <token>' and validate against ADMIN_BEARER."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Bearer token")
@@ -95,37 +126,17 @@ def require_bearer(request: Request):
     if token != ADMIN_BEARER:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Bearer token")
 
-# --------------------------------------------------
-# Small utils (kept for future)
-# --------------------------------------------------
-_slugify_re = re.compile(r"[^a-z0-9]+")
-def slugify(s: str) -> str:
-    s = (s or "").lower()
-    s = _slugify_re.sub("-", s).strip("-")
-    return s or "untitled"
+def require_token_param(token: Optional[str]):
+    """For GET /events/import-web (browser demo). Only allowed if ENABLE_IMPORT_WEB=true."""
+    if not ENABLE_IMPORT_WEB:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="import-web is disabled")
+    if not token or token != ADMIN_BEARER:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-def make_event_id(source_type: str, source_message_id: str, title: str, index: int | None = None) -> str:
-    base = f"{source_type or 'mock'}::{source_message_id or 'unknown'}::{title or 'untitled'}"
-    h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
-    suffix = f"-{index}" if index is not None else ""
-    return f"{(source_type or 'mock')}-{slugify(source_message_id)}-{slugify(title)}-{h}{suffix}"
-
-def _probe_db_count() -> Optional[int]:
-    session: Optional[Session] = None
-    try:
-        session = next(get_db())
-        session.execute(text("SELECT 1"))
-        return session.query(EventModel).count()
-    except Exception as e:
-        print(f"[health/db] probe failed: {e}")
-        return None
-    finally:
-        with suppress(Exception):
-            if session is not None:
-                session.close()
-
+# ------------------------------------------------------------------------------
+# Small utility: accept either ISO datetime or YYYY-MM-DD and normalize to ISO
+# ------------------------------------------------------------------------------
 def _iso_or_date(dt: Optional[str]) -> Optional[str]:
-    """Accept ISO datetime or YYYY-MM-DD. Return normalized ISO string."""
     if not dt:
         return None
     with suppress(Exception):
@@ -134,9 +145,9 @@ def _iso_or_date(dt: Optional[str]) -> Optional[str]:
         return datetime.strptime(dt, "%Y-%m-%d").date().isoformat()
     raise HTTPException(status_code=400, detail=f"Invalid datetime/date: {dt}")
 
-# --------------------------------------------------
-# Health endpoints
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Health endpoints (useful for platform checks and quick verification)
+# ------------------------------------------------------------------------------
 @app.get("/", include_in_schema=False)
 async def root():
     return {"msg": "ai-events-agent is running", "docs": "/docs", "health": "/health"}
@@ -147,14 +158,26 @@ async def health():
 
 @app.get("/health/db", include_in_schema=False)
 async def health_db():
+    """Try a quick DB query; return current event count and latency."""
     start = time.time()
-    count = _probe_db_count()
-    duration = round((time.time() - start) * 1000)
-    return {"ok": count is not None, "events": count, "duration_ms": duration}
+    count: Optional[int] = None
+    session: Optional[Session] = None
+    try:
+        session = next(get_db())
+        session.execute(text("SELECT 1"))  # connectivity check
+        count = session.query(EventModel).count()
+    except Exception as e:
+        print(f"[health/db] probe failed: {e}")
+    finally:
+        with suppress(Exception):
+            if session is not None:
+                session.close()
+    ms = round((time.time() - start) * 1000)
+    return {"ok": count is not None, "events": count, "duration_ms": ms}
 
-# --------------------------------------------------
-# Response model (maps ORM → JSON)
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Pydantic response model (maps ORM instance → JSON)
+# ------------------------------------------------------------------------------
 class EventOut(BaseModel):
     id: str
     title: str
@@ -171,18 +194,18 @@ class EventOut(BaseModel):
     updated_at: datetime
 
     class Config:
-        from_attributes = True
+        from_attributes = True  # allow Pydantic to read from SQLAlchemy model attributes
 
-# --------------------------------------------------
-# Events: read endpoints
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Events: read/list/search
+# ------------------------------------------------------------------------------
 @app.get("/events", response_model=List[EventOut], summary="List events")
 def list_events(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """List events found so far (sorted by start)."""
+    """List events (sorted by start; nulls last)."""
     return (
         db.query(EventModel)
         .order_by(EventModel.start.asc().nulls_last(), EventModel.id.asc())
@@ -194,14 +217,14 @@ def list_events(
 @app.get("/events/{event_id}", response_model=EventOut, summary="Get event by ID")
 def get_event(event_id: str, db: Session = Depends(get_db)):
     """
-    Return one event by its id.
-
-    NOTE: If your ID contains special URL characters (e.g., '#'),
-    encode them when calling this route (e.g., '#' → '%23'), or use /events/by-id.
+    Fetch a single event by its primary key (path parameter).
+    NOTE: If your ID contains '#', clients MUST URL-encode it as '%23', or use /events/by-id.
     """
+    # Try primary-key lookup first (fast path)
     obj = None
     with suppress(Exception):
         obj = db.get(EventModel, event_id)
+    # Fallback to explicit filter (covers some SQLAlchemy versions/engines)
     if obj is None:
         obj = db.query(EventModel).filter(EventModel.id == event_id).first()
     if not obj:
@@ -211,8 +234,8 @@ def get_event(event_id: str, db: Session = Depends(get_db)):
 @app.get("/events/by-id", response_model=EventOut, summary="Get event by ID (URL-safe)")
 def get_event_by_query(id: str = Query(..., description="Exact event id"), db: Session = Depends(get_db)):
     """
-    URL-safe 'get by id' using a query param.
-    Clients will automatically URL-encode special characters like '#'.
+    Browser-safe way to fetch by ID (query params are auto-encoded by browsers).
+    Use this if IDs can contain characters like '#'.
     """
     obj = db.get(EventModel, id)
     if not obj:
@@ -231,7 +254,7 @@ def search_events(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """Search events with simple filters. Uses ISO strings for time comparisons."""
+    """Simple text + time range search. Times are compared as ISO strings (UTC)."""
     sf = _iso_or_date(start_from)
     st = _iso_or_date(start_to)
 
@@ -251,6 +274,7 @@ def search_events(
                 EventModel.location.ilike(like),
             )
         )
+
     return (
         query.order_by(EventModel.start.asc().nulls_last(), EventModel.id.asc())
         .offset(offset)
@@ -258,43 +282,52 @@ def search_events(
         .all()
     )
 
-# --------------------------------------------------
-# Events: admin import (mock inbox → parser → db)
-# --------------------------------------------------
+# ------------------------------------------------------------------------------
+# Events: admin import (mock inbox → parser → DB)
+# ------------------------------------------------------------------------------
 @app.post("/events/import", summary="Import emails → parse → save events (admin)")
 async def import_emails(request: Request, db: Session = Depends(get_db)):
     """
-    Admin-only:
-    - Fetch emails (mock inbox for now).
-    - Parse emails into events.
-    - Upsert (merge) into DB by primary key (id).
-    - Sanitize IDs to be URL-safe (replace '#' → '-') to avoid fragment issues.
+    Admin-only (requires Bearer token).
+    1) Fetch emails from mock inbox (async).
+    2) Parse emails into normalized events.
+    3) Upsert into Postgres by primary key (id).
     """
     require_bearer(request)
+    return await _do_import(db)
 
-    # get_inbox() is async; await it directly
+@app.get("/events/import-web", include_in_schema=False)
+async def import_emails_web(token: Optional[str] = Query(None), db: Session = Depends(get_db)):
+    """
+    Optional (disabled by default). Enable by setting ENABLE_IMPORT_WEB=true.
+    Lets you trigger an import from a browser using:
+      GET /events/import-web?token=<ADMIN_BEARER>
+    Use for demos; turn off afterwards.
+    """
+    require_token_param(token)
+    return await _do_import(db)
+
+# Shared import implementation (used by both routes)
+async def _do_import(db: Session):
+    # 1) Read "emails" from the mock inbox
     try:
         emails = await get_inbox()
     except Exception as e:
-        # Surface a clear error if inbox fetch fails
         raise HTTPException(status_code=500, detail=f"failed to read inbox: {e}")
 
     if not emails:
-        # Not an error; just informative
         print("[import] inbox returned 0 messages")
 
+    # 2) Parse each email into 0..N events; 3) Upsert each event
     written = 0
     for mail in emails:
         try:
             events = parse_email_to_events(mail) or []
             for e in events:
-                raw_id = e.get("_id")
-                safe_id = raw_id.replace("#", "-") if raw_id else raw_id  # URL-safe ID
-
                 evt = EventModel(
-                    id=safe_id,
+                    id=e["_id"],  # IMPORTANT: we DO NOT modify the ID (Neon stays untouched)
                     title=e["title"] or "Untitled",
-                    start=e.get("start"),   # stored as ISO string (v1)
+                    start=e.get("start"),   # stored as ISO string (UTC)
                     end=e.get("end"),
                     location=e.get("location"),
                     description=e.get("description"),
@@ -307,7 +340,7 @@ async def import_emails(request: Request, db: Session = Depends(get_db)):
                 db.merge(evt)   # merge = upsert by primary key
                 written += 1
         except Exception as e:
-            # Keep going even if one email fails
+            # Keep importing even if one email fails; log and continue
             print(f"[import] parse/save error for message {mail.get('id')}: {e}")
 
     db.commit()
