@@ -1,9 +1,5 @@
-Here’s the final `app.py` — same behavior as your working setup, plus the **smallest Swagger enhancement** (an Authorize button for the admin POST). Everything else stays as-is.
-
-```python
 """
 AI Events Agent — FastAPI + Railway + Neon
-==========================================
 
 Purpose
 -------
@@ -27,17 +23,17 @@ Health:
 
 Events:
   GET  /events
-  GET  /events/id/{event_id}     ← unambiguous, no shadowing risk
-  GET  /events/by-id?id=...      ← browser-safe; accepts URL-encoded IDs
+  GET  /events/id/{event_id}     <- unambiguous, no shadowing risk
+  GET  /events/by-id?id=...      <- browser-safe; accepts URL-encoded IDs
   GET  /events/search
 
 Admin:
-  POST /events/import             ← protected via Swagger "Authorize" (Bearer)
+  POST /events/import             <- protected via Swagger "Authorize" (Bearer)
   GET  /events/import-web?token=...   (if ENABLE_IMPORT_WEB=true)
 
 Swagger Enhancement
 -------------------
-- Adds a simple HTTP Bearer security scheme so Swagger shows the "Authorize" button.
+- Adds an HTTP Bearer security scheme so Swagger shows the "Authorize" button.
 - Only /events/import uses this scheme (everything else unchanged).
 """
 
@@ -199,7 +195,6 @@ class EventOut(BaseModel):
 # ------------------------------------------------------------------------------
 # Events — define specific routes FIRST, then the unambiguous ID route LAST
 # ------------------------------------------------------------------------------
-
 @app.get("/events", response_model=List[EventOut], summary="List events")
 def list_events(
     limit: int = Query(50, ge=1, le=200),
@@ -273,7 +268,7 @@ def search_events(
 @app.post("/events/import", summary="Import emails → parse → save events (admin)")
 async def import_emails(
     db: Session = Depends(get_db),
-    _: None = Depends(verify_admin),  # ← Swagger "Authorize" enables Bearer here
+    _: None = Depends(verify_admin),  # Swagger "Authorize" enables Bearer here
 ):
     return await _do_import(db)
 
@@ -331,4 +326,3 @@ def get_event(event_id: str, db: Session = Depends(get_db)):
     if not obj:
         raise HTTPException(status_code=404, detail="Event not found")
     return obj
-```
