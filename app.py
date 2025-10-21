@@ -19,16 +19,25 @@ Endpoints
 Health:
   GET  /health
   GET  /health/db
+  GET  /robots.txt
+  GET  /favicon.ico
 
 Events:
   GET  /events
-  GET  /events/{id}
-  GET  /events/by-id?id=...
+  GET  /events/id/{event_id}     ← unambiguous, no shadowing risk
+  GET  /events/by-id?id=...      ← browser-safe; accepts URL-encoded IDs
   GET  /events/search
 
 Admin:
   POST /events/import
   GET  /events/import-web?token=...   (if ENABLE_IMPORT_WEB=true)
+
+Notes on Robustness
+-------------------
+- **No route shadowing**: the catch-all route is replaced with `/events/id/{event_id}`
+  to avoid collisions with `/events/search`, `/events/by-id`, `/events/import-web`, etc.
+- **Specific routes are defined before more general ones** (defensive ordering).
+- **/robots.txt** and **/favicon.ico** return noise-free responses to reduce 404 log spam.
 """
 
 import os
@@ -44,6 +53,7 @@ with suppress(Exception):
     load_dotenv()
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Query
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, text
@@ -61,7 +71,7 @@ ENABLE_IMPORT_WEB = os.getenv("ENABLE_IMPORT_WEB", "false").lower() in ("1", "tr
 
 app = FastAPI(
     title="AI Events Agent",
-    version="1.0.4",
+    version="1.0.5",
     description="Reads emails → extracts event info → stores in Postgres → simple API.",
 )
 
@@ -87,6 +97,7 @@ def startup():
         init_db()
         print("[startup] done")
     except Exception:
+        # Keep going so /health still responds; surface the issue in logs
         print("[startup] init_db failed:")
         traceback.print_exc()
 
@@ -123,7 +134,7 @@ def _iso_or_date(dt: Optional[str]) -> Optional[str]:
     raise HTTPException(status_code=400, detail=f"Invalid datetime/date: {dt}")
 
 # ------------------------------------------------------------------------------
-# Health
+# Health + misc
 # ------------------------------------------------------------------------------
 @app.get("/", include_in_schema=False)
 async def root():
@@ -152,6 +163,16 @@ async def health_db():
     ms = round((time.time() - start) * 1000)
     return {"ok": count is not None, "events": count, "duration_ms": ms}
 
+@app.get("/robots.txt", include_in_schema=False, response_class=PlainTextResponse)
+async def robots_txt():
+    # Reduce log noise from bots and uptime monitors
+    return "User-agent: *\nDisallow:\n"
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    # 204 = No Content; prevents 404 spam in logs
+    return Response(status_code=204)
+
 # ------------------------------------------------------------------------------
 # Schemas
 # ------------------------------------------------------------------------------
@@ -174,8 +195,9 @@ class EventOut(BaseModel):
         from_attributes = True
 
 # ------------------------------------------------------------------------------
-# Events
+# Events — define specific routes FIRST, then the most specific/ambiguous LAST
 # ------------------------------------------------------------------------------
+
 @app.get("/events", response_model=List[EventOut], summary="List events")
 def list_events(
     limit: int = Query(50, ge=1, le=200),
@@ -190,22 +212,11 @@ def list_events(
         .all()
     )
 
-@app.get("/events/{event_id}", response_model=EventOut, summary="Get event by ID")
-def get_event(event_id: str, db: Session = Depends(get_db)):
-    """
-    Fetch a single event by its primary key (path parameter).
-    NOTE: If your ID contains '#', clients MUST URL-encode it as '%23',
-    or use /events/by-id?id=... which is safe in browsers.
-    """
-    obj = db.get(EventModel, event_id)
-    if not obj:
-        obj = db.query(EventModel).filter(EventModel.id == event_id).first()
-    if not obj:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return obj
-
 @app.get("/events/by-id", response_model=EventOut, summary="Get event by ID (URL-safe)")
-def get_event_by_query(id: str = Query(..., description="Exact event id"), db: Session = Depends(get_db)):
+def get_event_by_query(
+    id: str = Query(..., description="Exact event id"),
+    db: Session = Depends(get_db),
+):
     """
     Browser-safe way to fetch by ID (query params are auto-encoded by browsers).
     Use this if IDs can contain characters like '#'.
@@ -255,21 +266,20 @@ def search_events(
     )
 
 # ------------------------------------------------------------------------------
-# Import (admin)
+# Admin (write)
 # ------------------------------------------------------------------------------
 @app.post("/events/import", summary="Import emails → parse → save events (admin)")
 async def import_emails(request: Request, db: Session = Depends(get_db)):
     require_bearer(request)
     return await _do_import(db)
 
-# Show in Swagger to avoid confusion during demos
 @app.get("/events/import-web", summary="Browser import demo (token required)")
 async def import_emails_web(token: Optional[str] = Query(None), db: Session = Depends(get_db)):
     require_token_param(token)
     return await _do_import(db)
 
-# Shared import implementation
 async def _do_import(db: Session):
+    """Shared import implementation."""
     try:
         emails = await get_inbox()
     except Exception as e:
@@ -296,7 +306,24 @@ async def _do_import(db: Session):
                 db.merge(evt)                   # upsert by primary key
                 written += 1
         except Exception as e:
+            # Keep importing others; log the failure
             print(f"[import] parse/save error for message {mail.get('id')}: {e}")
 
     db.commit()
     return {"ok": True, "emails": len(emails), "events_written": written}
+
+# ------------------------------------------------------------------------------
+# Get-by-ID (unambiguous path) — defined LAST to avoid any accidental shadowing
+# ------------------------------------------------------------------------------
+@app.get("/events/id/{event_id}", response_model=EventOut, summary="Get event by ID")
+def get_event(event_id: str, db: Session = Depends(get_db)):
+    """
+    Fetch a single event by its primary key (path parameter).
+    Using /events/id/{event_id} avoids shadowing /events/<fixed-routes>.
+    """
+    obj = db.get(EventModel, event_id)
+    if not obj:
+        obj = db.query(EventModel).filter(EventModel.id == event_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return obj
