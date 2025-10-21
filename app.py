@@ -8,7 +8,8 @@ What this service does (in plain english)
 3) Has health endpoints so Railway knows the app is alive.
 4) Exposes event endpoints:
    - GET  /events           → list events
-   - GET  /events/{id}      → get a single event
+   - GET  /events/{id}      → get a single event (URL-encode '#' as '%23' if present)
+   - GET  /events/by-id     → get a single event via query param (URL-safe)
    - GET  /events/search    → search events (non-recurring by default)
    - POST /events/import    → read mock inbox → parse → save events (admin only)
 
@@ -30,7 +31,6 @@ import re
 import time
 import hashlib
 import traceback
-import asyncio
 from contextlib import suppress
 from datetime import datetime
 from typing import Optional, List
@@ -55,7 +55,7 @@ ADMIN_BEARER = os.getenv("BEARER_TOKEN") or os.getenv("ADMIN_BEARER") or "change
 
 app = FastAPI(
     title="AI Events Agent",
-    version="1.0.0",
+    version="1.0.1",
     description="Reads emails → extracts event info → stores in Postgres → simple API.",
 )
 
@@ -193,12 +193,30 @@ def list_events(
 
 @app.get("/events/{event_id}", response_model=EventOut, summary="Get event by ID")
 def get_event(event_id: str, db: Session = Depends(get_db)):
-    """Return one event by its id."""
+    """
+    Return one event by its id.
+
+    NOTE: If your ID contains special URL characters (e.g., '#'),
+    encode them when calling this route (e.g., '#' → '%23'), or use /events/by-id.
+    """
     obj = None
     with suppress(Exception):
         obj = db.get(EventModel, event_id)
     if obj is None:
         obj = db.query(EventModel).filter(EventModel.id == event_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return obj
+
+@app.get("/events/by-id", response_model=EventOut, summary="Get event by ID (URL-safe)")
+def get_event_by_query(id: str = Query(..., description="Exact event id"), db: Session = Depends(get_db)):
+    """
+    URL-safe 'get by id' using a query param.
+    Clients will automatically URL-encode special characters like '#'.
+    """
+    obj = db.get(EventModel, id)
+    if not obj:
+        obj = db.query(EventModel).filter(EventModel.id == id).first()
     if not obj:
         raise HTTPException(status_code=404, detail="Event not found")
     return obj
@@ -250,6 +268,7 @@ async def import_emails(request: Request, db: Session = Depends(get_db)):
     - Fetch emails (mock inbox for now).
     - Parse emails into events.
     - Upsert (merge) into DB by primary key (id).
+    - Sanitize IDs to be URL-safe (replace '#' → '-') to avoid fragment issues.
     """
     require_bearer(request)
 
@@ -269,8 +288,11 @@ async def import_emails(request: Request, db: Session = Depends(get_db)):
         try:
             events = parse_email_to_events(mail) or []
             for e in events:
+                raw_id = e.get("_id")
+                safe_id = raw_id.replace("#", "-") if raw_id else raw_id  # URL-safe ID
+
                 evt = EventModel(
-                    id=e["_id"],  # parser uses _id → we store as id
+                    id=safe_id,
                     title=e["title"] or "Untitled",
                     start=e.get("start"),   # stored as ISO string (v1)
                     end=e.get("end"),
@@ -290,4 +312,3 @@ async def import_emails(request: Request, db: Session = Depends(get_db)):
 
     db.commit()
     return {"ok": True, "emails": len(emails), "events_written": written}
-
