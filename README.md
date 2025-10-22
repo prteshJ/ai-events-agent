@@ -40,6 +40,18 @@ Simple service that:
 - `POST /events/import` – import emails → parse → save events  
   Requires header: `Authorization: Bearer <ADMIN_BEARER>`
 
+  ## Gmail (Unread Inbox) — Setup & Env
+
+**Goal:** Let the app read *your* UNREAD Gmail messages safely (read-only).
+
+### What you need (once)
+- Google Cloud project with **Gmail API** enabled
+- OAuth **Web application** client (name anything)
+- Add redirect URI: `https://developers.google.com/oauthplayground`
+- Add yourself under **Audience → Test users** (new UI)
+- Use **OAuth 2.0 Playground** to get a **Refresh token** with scope:
+
+
 ## Quick test
 
 ```bash
@@ -55,3 +67,5 @@ curl "https://<your-app>/events/search?q=standup"
 
 # 4) Get by id (use an id from the list)
 curl "https://<your-app>/events/<id>"
+
+
