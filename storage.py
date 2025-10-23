@@ -1,72 +1,75 @@
-# storage.py — Database connection and ORM models using SQLAlchemy
-#
-# Exposes:
-#   - Event ORM model
-#   - init_db()  : create tables if missing
-#   - get_db()   : session generator for FastAPI
+"""
+storage.py
+----------
+Data model + persistence.
+
+Table expected (your Neon screenshot shows these columns):
+  events(
+    id varchar PRIMARY KEY,           -- we use Gmail message ID here
+    title varchar,
+    start varchar,                    -- ISO-8601 datetime string
+    end varchar,                      -- keep NULL for now
+    location varchar,
+    description text,
+    recurring boolean DEFAULT FALSE,
+    created_at timestamptz DEFAULT now()  -- optional, if present
+  )
+
+If id is not primary key yet, run once in Neon:
+  ALTER TABLE events ADD PRIMARY KEY (id);
+
+Environment:
+- DATABASE_URL
+"""
+
+from __future__ import annotations
 
 import os
-from datetime import datetime
+import psycopg2
+from pydantic import BaseModel, Field
 
-from sqlalchemy import create_engine, String, Text, Boolean, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker, Mapped, mapped_column
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@host/dbname")
+class ExtractedEvent(BaseModel):
+    """Structured event produced by the parser."""
+    title: str = Field(..., description="Main subject/title")
+    date_time: str = Field(..., description="ISO-8601 datetime (YYYY-MM-DDTHH:MM:SS)")
+    location: str | None = Field(None, description="Physical/virtual location")
+    summary: str | None = Field(None, description="One-sentence purpose")
 
-# Keep it simple and reliable
-CONNECT_ARGS = {}
-if DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg://")):
-    CONNECT_ARGS["connect_timeout"] = 5  # seconds
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    future=True,
-    connect_args=CONNECT_ARGS,
-)
+def _conn():
+    """Open a new psycopg2 connection using DATABASE_URL."""
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg2.connect(url)
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-Base = declarative_base()
 
-class Event(Base):
+def save_event(gmail_id: str, ev: ExtractedEvent) -> None:
     """
-    Event stored in 'events' table.
+    Upsert event row using Gmail message ID as the 'id'.
 
-    Notes:
-    - start/end are strings (ISO-8601). This keeps v1 simple.
-      (We can migrate to TIMESTAMPTZ later without changing the API.)
+    Maps:
+      ev.title     -> title
+      ev.date_time -> start
+      ev.location  -> location
+      ev.summary   -> description
+      end          -> NULL (future work)
+      recurring    -> FALSE (default)
+
+    On conflict, we update title/start/location/description.
     """
-    __tablename__ = "events"
+    sql = """
+    INSERT INTO events (id, title, start, end, location, description, recurring)
+    VALUES (%s, %s, %s, NULL, %s, %s, FALSE)
+    ON CONFLICT (id) DO UPDATE SET
+      title = EXCLUDED.title,
+      start = EXCLUDED.start,
+      location = EXCLUDED.location,
+      description = EXCLUDED.description;
+    """
+    args = (gmail_id, ev.title, ev.date_time, ev.location, ev.summary)
 
-    id: Mapped[str] = mapped_column(String(120), primary_key=True)
-    title: Mapped[str] = mapped_column(String(300), nullable=False)
-
-    # v1: ISO strings (e.g., "2025-10-21T09:30:00+00:00")
-    start: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    end: Mapped[str | None] = mapped_column(String(64), nullable=True)
-
-    location: Mapped[str | None] = mapped_column(String(300), nullable=True)
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    recurring: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    recurrence_rule: Mapped[str | None] = mapped_column(String(300), nullable=True)
-
-    source_type: Mapped[str] = mapped_column(String(30), nullable=False)
-    source_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    source_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    # small improvement: auto-update on row changes
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-
-def init_db():
-    """Create tables if they don't exist."""
-    Base.metadata.create_all(bind=engine)
-
-def get_db():
-    """Yield a DB session (FastAPI Depends)."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(sql, args)
