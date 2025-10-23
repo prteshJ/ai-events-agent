@@ -1,21 +1,15 @@
 """
 storage.py
 ----------
-Data model + persistence for events.
+Postgres persistence for events.
 
-Schema (relevant NOT NULL columns per Neon):
-  id (PK), title, recurring, source_type, source_message_id, created_at, updated_at
-Other columns we write:
-  "start", "end", location, description
+Your table has NOT NULL on: id, title, recurring, source_type, source_message_id, created_at, updated_at.
+We satisfy those and also handle reserved identifiers "start"/"end".
 
-We:
-- Quote "start"/"end" (reserved identifiers).
-- Insert source_type='gmail' and source_message_id=<gmail_id>.
-- Set created_at=NOW() on first insert.
-- Set updated_at=NOW() on every upsert.
-
-Env:
-- DATABASE_URL
+INSERT columns:
+  id, title, "start", "end", location, description, recurring, source_type, source_message_id, created_at, updated_at
+UPSERT (ON CONFLICT id) updates:
+  title, "start", location, description, source_type, source_message_id, updated_at
 """
 
 from __future__ import annotations
@@ -35,27 +29,10 @@ def _conn():
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
-    return psycopg2.connect(url)  # Neon URL includes ssl params
+    return psycopg2.connect(url)  # Neon URL includes SSL params
 
 
 def save_event(gmail_id: str, ev: ExtractedEvent) -> None:
-    """
-    Upsert event using Gmail message ID as primary key.
-
-    Maps:
-      ev.title     -> title
-      ev.date_time -> "start"
-      ev.location  -> location
-      ev.summary   -> description
-
-    Constant fields:
-      "end"               -> NULL (for now)
-      recurring           -> FALSE
-      source_type         -> 'gmail'
-      source_message_id   -> gmail_id
-      created_at          -> NOW() on first insert
-      updated_at          -> NOW() on every upsert
-    """
     sql = """
     INSERT INTO events
       (id, title, "start", "end", location, description,
