@@ -2,12 +2,11 @@
 parser.py
 ---------
 Gemini-driven structured event extraction (hardened):
-- Sanitizes GEMINI_MODEL (removes leading 'models/')
-- Sanitizes GEMINI_API_KEY (trims, strips quotes, leading '=')
-- Builds a correct v1beta generateContent URL
-- Forces JSON output; recovers JSON if wrapped
-- Normalizes date_time to ISO 'YYYY-MM-DDTHH:MM:SS'
-- Prints rich HTTP errors for quick diagnosis
+- Sanitizes GEMINI_MODEL (removes accidental 'models/' prefix)
+- Sanitizes GEMINI_API_KEY (trims quotes/leading '=')
+- Forces JSON via response_mime_type
+- Recovers JSON if model wraps it in text
+- Normalizes date_time to 'YYYY-MM-DDTHH:MM:SS'
 """
 
 from __future__ import annotations
@@ -17,21 +16,18 @@ from typing import Optional, Dict
 
 def _clean_model(raw: str | None) -> str:
     m = (raw or "gemini-2.5-flash").strip().strip('"').strip("'")
-    # remove any accidental 'models/' prefix
     if m.startswith("models/"):
         m = m[len("models/"):]
     return m or "gemini-2.5-flash"
 
 def _clean_key(raw: str | None) -> str:
     k = (raw or "").strip().strip('"').strip("'")
-    # remove accidental leading '=' (seen in logs)
     while k.startswith("="):
         k = k[1:]
     return k
 
 _GEMINI_MODEL = _clean_model(os.getenv("GEMINI_MODEL"))
 _GEMINI_API_KEY = _clean_key(os.getenv("GEMINI_API_KEY"))
-
 _API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent?key={_GEMINI_API_KEY}"
 
 _SYSTEM = (
@@ -60,9 +56,9 @@ def _normalize_iso(dt_str: str) -> Optional[str]:
     for f in fmts:
         try:
             dt = datetime.strptime(s, f)
-            if "H" not in f:  # date-only → default time
+            if "H" not in f:
                 dt = dt.replace(hour=9, minute=0, second=0)
-            elif "S" not in f:  # minute precision → set seconds=0
+            elif "S" not in f:
                 dt = dt.replace(second=0)
             return dt.strftime("%Y-%m-%dT%H:%M:%S")
         except ValueError:
@@ -96,10 +92,9 @@ def extract_event(email_text: str) -> Optional[Dict[str, object]]:
 
     try:
         r = requests.post(_API_URL, json=payload, timeout=30)
-        # If Google returns an error, show status + body for fast debugging
         try:
             r.raise_for_status()
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             print("❌ Gemini HTTP error:", r.status_code, r.text[:500])
             raise
 
