@@ -2,11 +2,13 @@ fastapi==0.115.2
 uvicorn==0.30.6
 requests==2.32.3
 pydantic==2.9.2
+
 google-api-python-client==2.147.0
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
-psycopg-binary==3.2.3          # ✅ Bundles libpq; fixes ImportError on Railway
-google-generativeai==0.8.3     # ✅ Needed for Gemini integration
 
-# Build bump comment to force Railway full reinstall
-# rebuild: 2025-10-24
+# ✅ Correct modern Postgres driver (v3) with binary wheels
+psycopg[binary]>=3.2.3
+
+# Gemini (optional smart parsing)
+google-generativeai==0.8.3
