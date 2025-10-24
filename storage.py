@@ -3,7 +3,7 @@ storage.py (v2)
 ---------------
 Postgres persistence for events (aligned with the final schema).
 
-New schema:
+Schema (must already exist):
 
   CREATE TABLE public.events (
     id BIGSERIAL PRIMARY KEY,
@@ -29,10 +29,12 @@ import os
 from typing import Optional, Dict, Any
 
 import psycopg  # psycopg v3
+from psycopg.types.json import Json  # <-- JSONB adapter (critical fix)
 from pydantic import BaseModel, Field
 
 
 class ExtractedEvent(BaseModel):
+    """Compatibility model for callers that extracted a structured event."""
     title: str = Field(..., description="Main subject/title")
     date_time: str = Field(..., description="ISO-8601 datetime (YYYY-MM-DDTHH:MM:SS[Z])")
     location: str | None = Field(None, description="Physical/virtual location")
@@ -93,17 +95,17 @@ def save_event(gmail_id: str, ev: ExtractedEvent) -> Optional[int]:
     """
 
     with _conn() as conn:
-        ensure_unique_index(conn)
+        ensure_unique_index(conn)  # harmless if already exists
         with conn.cursor() as cur:
             cur.execute(
                 sql,
                 (
-                    gmail_id,      # source_message_id
-                    ev.title,      # subject
-                    None,          # sender (unknown)
-                    ev.date_time,  # event_datetime (TIMESTAMPTZ)
-                    ev.location,   # location
-                    payload,       # raw_payload (JSONB)
+                    gmail_id,       # source_message_id
+                    ev.title,       # subject
+                    None,           # sender (unknown)
+                    ev.date_time,   # event_datetime (TIMESTAMPTZ)
+                    ev.location,    # location
+                    Json(payload),  # raw_payload → JSONB (critical)
                 ),
             )
             row = cur.fetchone()
