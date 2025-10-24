@@ -48,11 +48,11 @@ logging.basicConfig(
 log = logging.getLogger("ai-events-agent")
 
 # ----------------- Optional imports (tolerant) -----------------
-# DB driver (use psycopg-binary in requirements)
+# DB driver (psycopg v3; install as `psycopg[binary]`)
 try:
     import psycopg  # type: ignore
 except Exception as e:
-    psycopg = None
+    psycopg = None  # type: ignore
     log.warning("psycopg import unavailable: %s", e)
 
 # Gmail API libs (optional)
@@ -60,19 +60,19 @@ try:
     from googleapiclient.discovery import build  # type: ignore
     from google.oauth2.credentials import Credentials  # type: ignore
 except Exception:
-    build = None
-    Credentials = None
+    build = None  # type: ignore
+    Credentials = None  # type: ignore
 
 # Gemini AI libs (optional)
 try:
     import google.generativeai as genai  # type: ignore
 except Exception:
-    genai = None
+    genai = None  # type: ignore
 
 # ----------------- FastAPI -----------------
 app = FastAPI(
     title="AI Events Agent",
-    version="2.3.0",
+    version="2.3.1",
     # keeps the token remembered across refreshes — great for demos
     swagger_ui_parameters={"persistAuthorization": True},
 )
@@ -162,40 +162,59 @@ def ensure_indexes(conn: "psycopg.Connection") -> None:
 
 def insert_into_public_events(conn: "psycopg.Connection", rows: List[EventOut]) -> int:
     """
-    Insert rows into existing Neon table: public.events
+    Insert rows into Neon table: public.events (v2 schema)
 
-      - title             ← subject
-      - description       ← notes
-      - source_message_id ← source_gmail_id
-      - source_snippet    ← source_snippet
+    Columns:
+      - source_message_id TEXT UNIQUE  ← EventOut.source_gmail_id
+      - subject           TEXT         ← EventOut.subject
+      - sender            TEXT         ← (unknown here; None)
+      - event_datetime    TIMESTAMPTZ  ← (unknown here; None)
+      - location          TEXT         ← (unknown here; None)
+      - raw_payload       JSONB        ← dict(subject, notes, snippet, ...)
+      - created_at        TIMESTAMPTZ  ← DEFAULT NOW()
 
     Idempotency:
-      ON CONFLICT(source_message_id) DO NOTHING
+      ON CONFLICT (source_message_id) DO NOTHING
     """
     if not rows or conn is None:
         return 0
+
+    sql = """
+    INSERT INTO public.events
+      (source_message_id, subject, sender, event_datetime, location, raw_payload)
+    VALUES
+      (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (source_message_id) DO NOTHING
+    RETURNING id;
+    """
 
     inserted = 0
     with conn.cursor() as cur:
         for r in rows:
             if not r.source_gmail_id:
                 continue
+
+            raw_payload = {
+                "subject": r.subject,
+                "notes": r.notes,
+                "source_snippet": r.source_snippet,
+                "source_gmail_id": r.source_gmail_id,
+            }
+
             cur.execute(
-                """
-                INSERT INTO public.events (title, description, source_message_id, source_snippet)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (source_message_id) DO NOTHING;
-                """,
+                sql,
                 (
-                    r.subject,
-                    (r.notes or "")[:4000],
-                    r.source_gmail_id,
-                    (r.source_snippet or "")[:4000],
+                    r.source_gmail_id,  # source_message_id (UNIQUE)
+                    r.subject,          # subject
+                    None,               # sender (unknown here)
+                    None,               # event_datetime (unknown here)
+                    None,               # location (unknown here)
+                    raw_payload,        # raw_payload (JSONB)
                 ),
             )
-            # rowcount == 1 only when actually inserted (not on conflict)
-            if cur.rowcount == 1:
+            if cur.fetchone():
                 inserted += 1
+
     return inserted
 
 # ----------------- Gmail Helpers -----------------
@@ -223,10 +242,8 @@ def build_gmail_service():
 
 def fetch_gmail_messages(service, q: str, limit: int = 10) -> List[Tuple[str, str, str]]:
     """
-    Fetch UNREAD messages matching query.
+    Fetch messages matching query.
     Returns list of tuples: (message_id, subject, snippet)
-
-    Intentionally simple because your current setup works well.
     """
     if service is None:
         return []
@@ -387,7 +404,7 @@ def on_startup():
     """
     log.info("🚀 Starting AI Events Agent")
     if psycopg is None:
-        log.warning("psycopg not loaded — ensure psycopg-binary installed.")
+        log.warning("psycopg not loaded — ensure psycopg is installed.")
     if DATABASE_URL and psycopg is not None:
         conn = get_db()
         try:
