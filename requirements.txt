@@ -7,8 +7,8 @@ google-api-python-client==2.147.0
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
 
-# ✅ Correct modern Postgres driver (v3) with binary wheels
+# ✅ Correct modern Postgres driver (psycopg v3)
 psycopg[binary]>=3.2.3
 
-# Gemini (optional smart parsing)
+# Optional Gemini parsing (safe to omit if key not set)
 google-generativeai==0.8.3
